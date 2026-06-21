@@ -20,6 +20,7 @@
 - Python 3.x
 - Google Cloud SDK (gcloud CLI)
 - 必要な権限:
+    - `billing.accounts.get` または `billing.accounts.getProjectBillingInfo` (請求先アカウントとプロジェクトの紐付け情報の取得)
     - `discoveryengine.billingAccountLicenseConfigs.list` (請求先レベル)
     - `discoveryengine.licenseConfigs.list` (プロジェクトレベル)
     - `resourcemanager.projects.get` (プロジェクト情報取得)
@@ -46,12 +47,29 @@ gcloud config set project [YOUR_PROJECT_ID]
 pip install -r requirements.txt
 ```
 
+
 ## 使い方
 
-スクリプトを実行すると、アクセス可能なすべての請求先アカウントとプロジェクトを自動的に調査します。
+### 基本実行 (対話式選択)
+
+引数を指定せずに実行すると、アクセス可能な請求先アカウントの一覧が表示され、コンソール上で番号を入力して選択できます。
 
 ```bash
 python list_billing_licenses.py
+```
+
+
+### 請求先アカウントIDを直接指定して実行
+
+第一引数に請求先アカウントID（例：`012345-6789AB-CDEF01`）を直接指定することで、対話式選択をスキップして即時に対象アカウントに紐づくプロジェクトのみをスキャンできます。
+
+```bash
+python list_billing_licenses.py [BILLING_ACCOUNT_ID]
+```
+
+例：
+```bash
+python list_billing_licenses.py 012345-6789AB-CDEF01
 ```
 
 ### 出力項目の説明
@@ -64,3 +82,4 @@ python list_billing_licenses.py
 | **Config ID** | サブスクリプションのユニークな管理 ID |
 | **Tier** | ライセンスの種類 (Gemini Enterprise Plus, NotebookLM 等) |
 | **Start / End** | ライセンスの有効期間 |
+

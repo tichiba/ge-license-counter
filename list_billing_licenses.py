@@ -1,9 +1,10 @@
 import google.auth
 import google.auth.transport.requests
 import requests
-import json
 import sys
 import subprocess
+import argparse
+
 
 def get_quota_project():
     """
@@ -44,13 +45,14 @@ def list_billing_accounts(token):
         return []
     return response.json().get('billingAccounts', [])
 
-def list_projects(token):
+def list_projects(token, billing_account_id):
     """
-    すべてのアクティブなプロジェクトを取得します。
+    指定された請求先アカウントに紐づく、アクティブかつアクセス権限のあるプロジェクトを取得します。
     """
-    url = "https://cloudresourcemanager.googleapis.com/v1/projects"
+    # 1. 請求先アカウントに紐づくプロジェクトID一覧を取得
+    url = f"https://cloudbilling.googleapis.com/v1/billingAccounts/{billing_account_id}/projects"
     headers = {"Authorization": f"Bearer {token}"}
-    projects = []
+    billing_projects = []
     page_token = None
     while True:
         params = {"pageToken": page_token} if page_token else {}
@@ -58,27 +60,24 @@ def list_projects(token):
         if response.status_code != 200:
             break
         data = response.json()
-        projects.extend(data.get('projects', []))
+        billing_projects.extend(data.get('projectBillingInfo', []))
         page_token = data.get('nextPageToken')
         if not page_token:
             break
-    return [p for p in projects if p['lifecycleState'] == 'ACTIVE']
-
-def get_project_id_from_number(token, project_number, project_map):
-    """
-    プロジェクト番号をプロジェクトIDに変換します。
-    """
-    if project_number in project_map:
-        return project_map[project_number]
+            
+    project_ids = [p['projectId'] for p in billing_projects if p.get('billingEnabled', False)]
     
-    url = f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_number}"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        pid = response.json().get('projectId', project_number)
-        project_map[project_number] = pid
-        return pid
-    return project_number
+    # 2. 各プロジェクトの詳細（projectNumberなど）を Cloud Resource Manager API から取得
+    projects = []
+    for pid in project_ids:
+        proj_url = f"https://cloudresourcemanager.googleapis.com/v1/projects/{pid}"
+        response = requests.get(proj_url, headers=headers)
+        if response.status_code == 200:
+            proj_data = response.json()
+            if proj_data.get('lifecycleState') == 'ACTIVE':
+                projects.append(proj_data)
+                
+    return projects
 
 def format_date(date_obj):
     """
@@ -130,38 +129,74 @@ def main():
     token = credentials.token
     print(f"Using Quota Project: {quota_project}")
     
-    project_map = {}
+    # 引数解析: 第一位置引数として billing_account_id を受け取る
+    parser = argparse.ArgumentParser(description="Google Cloud Discovery Engine licenses counter")
+    parser.add_argument("billing_account_id", nargs="?", help="Target Billing Account ID (e.g. 012345-6789AB-CDEF01)")
+    args = parser.parse_args()
+
+    selected_ba_id = args.billing_account_id
+    selected_ba_name = "N/A"
+
+    if not selected_ba_id:
+        print("請求先アカウントのリストを取得しています...")
+        billing_accounts = list_billing_accounts(token)
+        if not billing_accounts:
+            print("アクセス可能な請求先アカウントが見つかりませんでした。")
+            sys.exit(1)
+        
+        print("\n利用可能な請求先アカウント一覧:")
+        for idx, ba in enumerate(billing_accounts):
+            ba_id = ba['name'].split('/')[-1]
+            print(f"[{idx}] {ba['displayName']} ({ba_id})")
+        
+        while True:
+            try:
+                choice = input("\nスキャン対象の請求先アカウント番号を入力してください: ")
+                choice_idx = int(choice)
+                if 0 <= choice_idx < len(billing_accounts):
+                    selected_ba = billing_accounts[choice_idx]
+                    selected_ba_id = selected_ba['name'].split('/')[-1]
+                    selected_ba_name = selected_ba['displayName']
+                    break
+                else:
+                    print(f"0 から {len(billing_accounts) - 1} の範囲で入力してください。")
+            except ValueError:
+                print("有効な数値を入力してください。")
+    else:
+        # 入力された請求アカウントの表示名を探す（あれば表示）
+        billing_accounts = list_billing_accounts(token)
+        for ba in billing_accounts:
+            ba_id = ba['name'].split('/')[-1]
+            if ba_id == selected_ba_id:
+                selected_ba_name = ba['displayName']
+                break
+
+    print(f"\n選択された請求先アカウント: {selected_ba_name} ({selected_ba_id})")
     
-    # 請求先側のライセンス設定とプロジェクト側の設定を紐付けるためのマップ
-    # Key: プロジェクト側ライセンス設定のフルパス
-    # Value: { 請求先名, 請求先側の設定ID }
     billing_link_map = {}
 
-    # ステップ1: 請求先アカウント側の分配情報を収集
-    print("請求先アカウントの分配情報を収集中...")
-    billing_accounts = list_billing_accounts(token)
-    for ba in billing_accounts:
-        ba_id = ba['name'].split('/')[-1]
-        ba_name = ba['displayName']
-        configs = get_billing_license_configs(token, ba_id, quota_project)
-        if configs:
-            for config in configs:
-                ba_config_id = config['name'].split('/')[-1]
-                distributions = config.get('licenseConfigDistributions', {})
-                for proj_config_path, _ in distributions.items():
-                    billing_link_map[proj_config_path] = {
-                        "ba_name": ba_name,
-                        "ba_config_id": ba_config_id
-                    }
 
-    # ステップ2: 全プロジェクトを走査し、ライセンス情報を取得・名寄せ（Reconcile）
-    print("各プロジェクトをスキャンしてライセンス情報を名寄せ中...")
+    # ステップ1: 選択された請求先アカウントの分配情報を収集
+    print(f"請求先アカウント {selected_ba_id} の分配情報を収集中...")
+    configs = get_billing_license_configs(token, selected_ba_id, quota_project)
+    if configs:
+        for config in configs:
+            ba_config_id = config['name'].split('/')[-1]
+            distributions = config.get('licenseConfigDistributions', {})
+            for proj_config_path, _ in distributions.items():
+                billing_link_map[proj_config_path] = {
+                    "ba_name": selected_ba_name if selected_ba_name != "N/A" else selected_ba_id,
+                    "ba_config_id": ba_config_id
+                }
+
+    # ステップ2: 請求先アカウントに紐づくプロジェクトのみを走査し、ライセンス情報を取得・名寄せ（Reconcile）
+    print(f"請求先アカウント {selected_ba_id} に紐づくプロジェクトをスキャン中...")
     all_data = []
-    projects = list_projects(token)
+    projects = list_projects(token, selected_ba_id)
     for p in projects:
         proj_id = p['projectId']
         proj_num = p['projectNumber']
-        project_map[proj_num] = proj_id
+
         
         project_configs = get_project_direct_licenses(token, proj_id, quota_project)
         for config in project_configs:
